@@ -51,7 +51,7 @@ OWNER_USER_IDS = {
     760023911764197396,
 }
 
-SPAM_CHANNEL_ID = 1548670456385765426
+SPAM_CHANNEL_ID = 1564987120861446174
 SPAM_DATABASE_FILE = "spam_bot.db"
 
 TWO_HOURS = 2 * 60 * 60 + 10 * 60  # 2 hours 10 minutes
@@ -60,8 +60,14 @@ SIX_HOURS = 6 * 60 * 60
 SPAM_SHORT_LABEL = "2H 10M"
 
 intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+
+# command_prefix must be a valid string/list/callable, never None,
+# or discord.py raises a TypeError the moment a message event fires.
+# It's unused here since this bot is slash-command only.
+bot = commands.Bot(
+    command_prefix="!spamunused_",
+    intents=intents
+)
 
 spam_lock = asyncio.Lock()
 
@@ -1216,6 +1222,426 @@ async def on_ready():
 
     print("📢 Spam system is running!")
     print("⏱️ Spam: independent 2H 10M / 6H timers")
+    print("===================================")
+
+
+# =========================================================
+# FARM TIMER (PRIVATE PER USER) - CHOOSE LOOMING OR FENCE
+# =========================================================
+from typing import Optional
+
+LOOMING_SECONDS = (3 * 24 * 60 * 60) + (16 * 60 * 60)               # 3d 16h
+FENCE_SECONDS = (1 * 24 * 60 * 60) + (5 * 60 * 60) + (20 * 60)      # 1d 5h 20m
+
+FARM_TIMERS = {
+    "looming": {"label": "Looming", "seconds": LOOMING_SECONDS, "emoji": "🧵"},
+    "fence":   {"label": "Fence",   "seconds": FENCE_SECONDS,   "emoji": "🚧"},
+}
+FARM_CHOICES = [
+    app_commands.Choice(name="🧵 Looming (3d 16h)", value="looming"),
+    app_commands.Choice(name="🚧 Fence (1d 5h 20m)", value="fence"),
+]
+
+# Keep track of open /farm messages so their countdowns can update automatically.
+# Key: Discord message ID; value: (user ID, Discord message object).
+FARM_PANEL_MESSAGES = {}
+
+def format_long_time(seconds):
+    """Format seconds as e.g. '3d 16h 5m 30s'."""
+    seconds = max(0, int(seconds))
+    days = seconds // 86400
+    hours = (seconds % 86400) // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    if days > 0:
+        return f"{days}d {hours}h {minutes}m {secs}s"
+    if hours > 0:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes > 0:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+def farm_countdown(end_time):
+    if end_time is None:
+        return "🟢 **READY**"
+    remaining = end_time - time.time()
+    if remaining <= 0:
+        return "🟢 **READY**"
+    return f"⏳ `{format_long_time(remaining)}`"
+
+def initialize_farm_database():
+    conn = get_spam_db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS farm_entries (
+            user_id INTEGER NOT NULL,
+            world TEXT NOT NULL,
+            farm_type TEXT NOT NULL,
+            end_time REAL,
+            PRIMARY KEY (user_id, world, farm_type)
+        )
+    """)
+    conn.commit()
+    conn.close()
+    print("✅ Farm database initialized.")
+
+def farm_get_all(user_id):
+    conn = get_spam_db()
+    rows = conn.execute(
+        "SELECT * FROM farm_entries WHERE user_id = ? ORDER BY farm_type, world",
+        (user_id,)
+    ).fetchall()
+    conn.close()
+    return rows
+
+def farm_get(user_id, world, farm_type):
+    conn = get_spam_db()
+    row = conn.execute(
+        "SELECT * FROM farm_entries WHERE user_id = ? AND world = ? AND farm_type = ?",
+        (user_id, world, farm_type)
+    ).fetchone()
+    conn.close()
+    return row
+
+def farm_add(user_id, world, farm_type):
+    conn = get_spam_db()
+    conn.execute(
+        "INSERT INTO farm_entries (user_id, world, farm_type, end_time) VALUES (?, ?, ?, NULL)",
+        (user_id, world, farm_type)
+    )
+    conn.commit()
+    conn.close()
+
+def farm_remove(user_id, world, farm_type):
+    conn = get_spam_db()
+    cur = conn.execute(
+        "DELETE FROM farm_entries WHERE user_id = ? AND world = ? AND farm_type = ?",
+        (user_id, world, farm_type)
+    )
+    removed = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return removed
+
+def farm_set_end(user_id, world, farm_type, end_time):
+    conn = get_spam_db()
+    conn.execute(
+        "UPDATE farm_entries SET end_time = ? WHERE user_id = ? AND world = ? AND farm_type = ?",
+        (end_time, user_id, world, farm_type)
+    )
+    conn.commit()
+    conn.close()
+
+def farm_embed(user_id):
+    embed = discord.Embed(
+        title="🌾 YOUR FARM TIMERS",
+        color=discord.Color.green()
+    )
+    rows = farm_get_all(user_id)
+    if not rows:
+        embed.description = (
+            "You haven't added any farm worlds yet.\n"
+            "Use `/farmadd` to add one."
+        )
+        return embed
+
+    text = ""
+    for key, info in FARM_TIMERS.items():
+        group = [r for r in rows if r["farm_type"] == key]
+        if not group:
+            continue
+        text += f"{info['emoji']} **{info['label'].upper()}**\n"
+        for r in group:
+            text += f"🌎 **{r['world']}** → {farm_countdown(r['end_time'])}\n"
+        text += "\n"
+
+    embed.description = text.rstrip()[:4000]
+    embed.set_footer(text="Only you can see this • Pick a world to start its timer")
+    return embed
+
+class FarmSelect(discord.ui.Select):
+    def __init__(self, user_id):
+        self.user_id = user_id
+        rows = farm_get_all(user_id)
+        options = []
+        for r in rows[:25]:
+            info = FARM_TIMERS.get(r["farm_type"])
+            if not info:
+                continue
+            options.append(
+                discord.SelectOption(
+                    label=f"{r['world']} — {info['label']}"[:100],
+                    value=f"{r['world']}|{r['farm_type']}"[:100],
+                    emoji=info["emoji"]
+                )
+            )
+        if not options:
+            options = [discord.SelectOption(label="No farms yet", value="__none__")]
+        super().__init__(placeholder="🌾 Select a farm to start its timer...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        value = self.values[0]
+        if value == "__none__":
+            await interaction.response.send_message(
+                "❌ Add a farm first with `/farmadd`.", ephemeral=True
+            )
+            return
+
+        world, farm_type = value.rsplit("|", 1)
+        info = FARM_TIMERS[farm_type]
+        row = farm_get(interaction.user.id, world, farm_type)
+        if row is None:
+            await interaction.response.send_message(
+                "❌ That farm no longer exists.", ephemeral=True
+            )
+            return
+
+        if row["end_time"] and row["end_time"] > time.time():
+            await interaction.response.send_message(
+                f"⏳ **{world} — {info['label']}** is already running "
+                f"(`{format_long_time(row['end_time'] - time.time())}` left).",
+                ephemeral=True
+            )
+            return
+
+        farm_set_end(interaction.user.id, world, farm_type, time.time() + info["seconds"])
+        await interaction.response.edit_message(
+            embed=farm_embed(interaction.user.id),
+            view=FarmView(interaction.user.id)
+        )
+
+class FarmView(discord.ui.View):
+    def __init__(self, user_id):
+        super().__init__(timeout=600)
+        self.user_id = user_id
+        self.add_item(FarmSelect(user_id))
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ This isn't your panel.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary)
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=farm_embed(self.user_id),
+            view=FarmView(self.user_id)
+        )
+
+@bot.tree.command(name="farm", description="View your farm timers")
+async def farm(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        embed=farm_embed(interaction.user.id),
+        view=FarmView(interaction.user.id),
+    )
+    # Save this message so the background loop can update the countdown live.
+    try:
+        message = await interaction.original_response()
+        FARM_PANEL_MESSAGES[message.id] = (interaction.user.id, message)
+    except discord.HTTPException as e:
+        print(f"❌ Could not register farm panel for auto-countdown: {e}")
+
+@bot.tree.command(name="farmadd", description="Add a farm world (only you can see it)")
+@app_commands.describe(
+    world="The world name",
+    farm_type="Which farm is this for?"
+)
+@app_commands.choices(farm_type=FARM_CHOICES)
+async def farmadd(
+    interaction: discord.Interaction,
+    world: str,
+    farm_type: app_commands.Choice[str]
+):
+    world = normalize_world(world)
+    if len(world) > 80:
+        await interaction.response.send_message("❌ World name is too long.", ephemeral=True)
+        return
+    if "|" in world:
+        await interaction.response.send_message(
+            "❌ World name can't contain the `|` character.", ephemeral=True
+        )
+        return
+
+    key = farm_type.value
+    info = FARM_TIMERS[key]
+
+    if farm_get(interaction.user.id, world, key):
+        await interaction.response.send_message(
+            f"❌ You already added **{world}** as {info['label']}.", ephemeral=True
+        )
+        return
+
+    farm_add(interaction.user.id, world, key)
+    await interaction.response.send_message(
+        f"✅ **{world}** added to your private **{info['emoji']} {info['label']}** list.\n"
+        f"⏱️ Timer: `{format_long_time(info['seconds'])}`\n"
+        "Use `/farm` to start it.",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="farmremove", description="Remove one of your farm worlds")
+@app_commands.describe(
+    world="The world to remove",
+    farm_type="Which farm it was added to"
+)
+@app_commands.choices(farm_type=FARM_CHOICES)
+async def farmremove(
+    interaction: discord.Interaction,
+    world: str,
+    farm_type: app_commands.Choice[str]
+):
+    world = normalize_world(world)
+    info = FARM_TIMERS[farm_type.value]
+    if farm_remove(interaction.user.id, world, farm_type.value):
+        await interaction.response.send_message(
+            f"✅ **{world}** removed from {info['label']}.", ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"❌ **{world}** isn't in your {info['label']} list.", ephemeral=True
+        )
+
+@bot.tree.command(name="farmreset", description="Reset farm timers (a world, or 'all')")
+@app_commands.describe(
+    world="World name, or 'all'",
+    farm_type="Optional: only reset this farm type"
+)
+@app_commands.choices(farm_type=FARM_CHOICES)
+async def farmreset(
+    interaction: discord.Interaction,
+    world: str,
+    farm_type: Optional[app_commands.Choice[str]] = None
+):
+    world = normalize_world(world)
+    wanted_type = farm_type.value if farm_type else None
+    count = 0
+
+    for r in farm_get_all(interaction.user.id):
+        if world != "ALL" and r["world"] != world:
+            continue
+        if wanted_type and r["farm_type"] != wanted_type:
+            continue
+        farm_set_end(interaction.user.id, r["world"], r["farm_type"], None)
+        count += 1
+
+    if count == 0:
+        await interaction.response.send_message(
+            "❌ No matching farms found in your list.", ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        f"✅ Reset **{count}** timer(s).", ephemeral=True
+    )
+
+@tasks.loop(seconds=1)
+async def farm_panel_update_loop():
+    """Edit open farm panels so HH:MM:SS changes without pressing Refresh."""
+    expired_message_ids = []
+
+    for message_id, (user_id, message) in list(FARM_PANEL_MESSAGES.items()):
+        try:
+            await message.edit(embed=farm_embed(user_id))
+        except discord.NotFound:
+            # The user deleted the panel message.
+            expired_message_ids.append(message_id)
+        except discord.Forbidden:
+            # The bot can no longer edit this message.
+            expired_message_ids.append(message_id)
+        except discord.HTTPException as e:
+            # Keep tracking the panel for transient API errors/rate limits.
+            print(f"❌ Farm panel auto-countdown edit failed: {e}")
+
+    for message_id in expired_message_ids:
+        FARM_PANEL_MESSAGES.pop(message_id, None)
+
+
+@farm_panel_update_loop.before_loop
+async def before_farm_panel_update_loop():
+    await bot.wait_until_ready()
+
+
+@tasks.loop(seconds=10)
+async def farm_timer_loop():
+    try:
+        now = time.time()
+        conn = get_spam_db()
+        rows = conn.execute(
+            "SELECT * FROM farm_entries WHERE end_time IS NOT NULL AND end_time <= ?",
+            (now,)
+        ).fetchall()
+        conn.close()
+
+        for row in rows:
+            user_id = row["user_id"]
+            world = row["world"]
+            farm_type = row["farm_type"]
+            info = FARM_TIMERS.get(farm_type)
+            if not info:
+                continue
+
+            farm_set_end(user_id, world, farm_type, None)
+            try:
+                user = await bot.fetch_user(user_id)
+                await user.send(
+                    f"{info['emoji']} Your farm **{world}** — "
+                    f"**{info['label']}** is ready!"
+                )
+            except discord.Forbidden:
+                # DMs closed: ping in channel WITHOUT revealing the world name
+                channel = bot.get_channel(SPAM_CHANNEL_ID)
+                if channel:
+                    await channel.send(
+                        f"{info['emoji']} <@{user_id}> one of your "
+                        f"**{info['label']}** timers is ready! (Use `/farm`)",
+                        delete_after=60
+                    )
+            except Exception as e:
+                print(f"❌ Farm ping error: {e}")
+    except Exception as e:
+        print(f"❌ Farm timer loop error: {e}")
+
+@farm_timer_loop.before_loop
+async def before_farm_timer_loop():
+    await bot.wait_until_ready()
+
+@bot.event
+async def on_ready():
+    print("===================================")
+    print(f"Logged in as {bot.user}")
+    print(f"Bot ID: {bot.user.id}")
+    print("===================================")
+
+    initialize_spam_database()
+    initialize_farm_database()          # <-- NEW
+
+    if not hasattr(bot, "_spam_view_registered"):
+        bot.add_view(SpamView())
+        bot._spam_view_registered = True
+        print("Persistent Spam panel registered.")
+
+    try:
+        synced = await bot.tree.sync()
+        print(f"✅ Synced {len(synced)} slash commands.")
+    except Exception as e:
+        print(f"Slash command sync error: {e}")
+
+    if not spam_timer_loop.is_running():
+        spam_timer_loop.start()
+        print("Spam timer loop started.")
+
+    if not farm_timer_loop.is_running():    # <-- NEW
+        farm_timer_loop.start()
+        print("Farm timer loop started.")
+
+    if not farm_panel_update_loop.is_running():
+        farm_panel_update_loop.start()
+        print("Farm panel live countdown updater started.")
+
+    await update_spam_panel()
+
+    print("📢 Spam system is running!")
+    print("🌾 Farm system is running!")
     print("===================================")
 
 # =========================================================
