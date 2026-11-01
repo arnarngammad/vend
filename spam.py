@@ -60,14 +60,8 @@ SIX_HOURS = 6 * 60 * 60
 SPAM_SHORT_LABEL = "2H 10M"
 
 intents = discord.Intents.default()
-
-# command_prefix must be a valid string/list/callable, never None,
-# or discord.py raises a TypeError the moment a message event fires.
-# It's unused here since this bot is slash-command only.
-bot = commands.Bot(
-    command_prefix="!spamunused_",
-    intents=intents
-)
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 spam_lock = asyncio.Lock()
 
